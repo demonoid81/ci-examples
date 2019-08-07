@@ -1,0 +1,323 @@
+variables:
+  DOCKER_DRIVER: overlay2
+  KUBECONFIG: /etc/deploy/config
+
+stages:
+  - build
+  - test
+  - deploy
+  - approve_dev
+  - stage
+  - approve_stage
+  - production
+  - destroy
+
+.build_front: &build_front
+  stage: build
+  image: docker:stable-git
+  services:
+  - docker:stable-dind
+  script:
+  - setup_docker
+  - build_front
+
+build_front_from_commit:
+  <<: *build_front
+  only:
+    variables:
+      - $CI_COMMIT_MESSAGE =~ /to deploy/
+
+build_front_from_master:
+  <<: *build_front
+  only:
+    - master
+
+.build_api: &build_api
+  stage: build
+  image: docker:stable-git
+  services:
+  - docker:stable-dind
+  script:
+  - setup_docker
+  - build_api
+
+build_api_from_commit:
+  <<: *build_api
+  only:
+    variables:
+      - $CI_COMMIT_MESSAGE =~ /to deploy/
+
+build_api_from_master:
+  <<: *build_api
+  only:
+    - master
+
+.build_admin: &build_admin
+  stage: build
+  image: docker:stable-git
+  services:
+  - docker:stable-dind
+  script:
+  - setup_docker
+  - build_admin
+
+build_admin_from_commit:
+  <<: *build_admin
+  only:
+    variables:
+      - $CI_COMMIT_MESSAGE =~ /to deploy/
+
+build_admin_from_master:
+  <<: *build_admin
+  only:
+    - master
+
+.build_notifier: &build_notifier
+  stage: build
+  image: docker:stable-git
+  services:
+  - docker:stable-dind
+  script:
+  - setup_docker
+  - build_notifier
+
+build_notifier_from_commit:
+  <<: *build_notifier
+  only:
+    variables:
+      - $CI_COMMIT_MESSAGE =~ /to deploy/
+
+build_notifier_from_master:
+  <<: *build_notifier
+  only:
+    - master
+
+
+test:
+ stage: test
+ script:
+ - 'echo test'
+
+# Сборка ветки мастер
+deploy master on dev:
+  stage: deploy
+  image: gitlab.ci.likvi.com:4567/devops/helm-kubectl:latest
+  script:
+    - initialize_tiller
+    - helm dep build helm-uremont/
+    - export DEPLOYS=$(helm ls | grep uremont-dev | wc -l)
+    - helm upgrade --install uremont-dev helm-uremont/
+      --namespace=uremont-dev --set "global.tag=${CI_COMMIT_SHA}"
+      --set "global.releaseName=dev"
+      --set "global.domain=dev.likvi.com"
+      --set "global.gitlab_secret=${gitlab_secret}";
+  only:
+    - master
+
+# Сборка рабочих веток c
+deploy_brances:
+  stage: deploy
+  image: gitlab.ci.likvi.com:4567/devops/helm-kubectl:latest
+  script:
+    - initialize_tiller
+    - helm dep build helm-uremont
+    - helm upgrade --install uremont-${BRANCH} helm-uremont/
+      --namespace=uremont-${BRANCH} --set "global.tag=${CI_COMMIT_SHA}"
+      --set "global.releaseName=${BRANCH}"
+      --set "global.domain=${BRANCH}.likvi.com"
+      --set "global.app_repo=${CI_APPLICATION_REPOSITORY}"
+      --set "global.gitlab_secret=${gitlab_secret}";
+    - update_dns
+    - echo ""
+  only:
+    variables:
+      - $CI_COMMIT_MESSAGE =~ /to deploy/
+
+approve dev:
+  stage: approve_dev
+  when: manual
+  script:
+    - mkdir -p .ci_status
+    - echo $(date +%s) > .ci_status/approved_dev
+  only:
+    - master
+
+NOT approve dev:
+  stage: approve_dev
+  when: manual
+  script:
+    - mkdir -p .ci_status
+    - echo $(date +%s) > .ci_status/not_approved_dev
+  only:
+    - master
+
+deploy master on stage:
+  stage: stage
+  when: manual
+  image: gitlab.ci.likvi.com:4567/devops/helm-kubectl:latest
+  script:
+    - if [[ $(cat .ci_status/not_approved_dev) > $(cat .ci_status/approved_dev) ]]; then echo "Нужно разрешение от релиз-инженера"; exit 1; fi
+    - initialize_tiller
+    - helm dep build helm-uremont/
+    - export DEPLOYS=$(helm ls | grep uremont-dev | wc -l)
+    - helm upgrade --install uremont-dev helm-uremont/
+      --namespace=uremont-stage --set "global.tag=${CI_COMMIT_SHA}"
+      --set "global.releaseName=stage"
+      --set 'global.domain=stage.likvi.com'
+      --set "global.gitlab_secret=${gitlab_secret}";
+  only:
+    - master
+
+approve stage:
+  stage: approve_stage
+  when: manual
+  script:
+    - mkdir -p .ci_status
+    - echo $(date +%s) > .ci_status/approved_stage
+  only:
+    - master
+
+NOT approve stage:
+  stage: approve_stage
+  when: manual
+  script:
+    - mkdir -p .ci_status
+    - echo $(date +%s) > .ci_status/not_approved_stage
+  only:
+    - master
+
+
+deploy master on prod:
+  stage: production
+  when: manual
+  image: gitlab.ci.likvi.com:4567/devops/helm-kubectl:latest
+  script:
+    - initialize_tiller
+    - helm dep build helm-uremont/
+    - helm upgrade --install uremont-dev helm-uremont/
+      --namespace=uremont
+      --set "global.tag=${CI_COMMIT_SHA}"
+      --set "global.releaseName=dev"
+      --set 'global.domain=uremont.com'
+      --set "global.gitlab_secret=${gitlab_secret}";
+    - echo ""
+  only:
+    - master
+
+destroy_branches:
+  stage: destroy
+  when: manual
+  image: gitlab.ci.likvi.com:4567/devops/helm-kubectl:latest
+  script:
+    - initialize_tiller
+    - helm dep build helm-uremont/
+    - helm delete --purge uremont-${BRANCH}
+    - delete_dns
+    - echo ""
+  only:
+    variables:
+      - $CI_COMMIT_MESSAGE =~ /to deploy/
+
+
+
+
+.auto_devops: &auto_devops |
+  [[ "$TRACE" ]] && set -x
+  export BRANCH=$(echo ${CI_COMMIT_REF_NAME} | tr '[:upper:]' '[:lower:]')
+  export CI_APPLICATION_REPOSITORY=${CI_REGISTRY}/${CI_PROJECT_PATH}/${BRANCH}
+  export CI_APPLICATION_TAG=$CI_COMMIT_SHA
+  export CI_CONTAINER_NAME=ci_job_build_${CI_JOB_ID}
+
+
+  function setup_docker() {
+    if ! docker info &>/dev/null; then
+      if [ -z "$DOCKER_HOST" -a "$KUBERNETES_PORT" ]; then
+        export DOCKER_HOST='tcp://localhost:2375'
+      fi
+    fi
+  }
+
+  function registry_login() {
+    if [[ -n "$CI_REGISTRY_USER" ]]; then
+      echo "Logging to GitLab Container Registry with CI credentials..."
+      echo $CI_JOB_TOKEN | docker login -u gitlab-ci-token "$CI_REGISTRY" --password-stdin
+      echo ""
+    fi
+  }
+
+  function build_front() {
+    registry_login
+    echo "Building Dockerfile-based application..."
+    #cd frontend
+    docker pull "$CI_APPLICATION_REPOSITORY/frontend:latest" || true
+    docker build --cache-from "$CI_APPLICATION_REPOSITORY/frontend:latest" -t "$CI_APPLICATION_REPOSITORY/frontend:$CI_APPLICATION_TAG" -t "$CI_APPLICATION_REPOSITORY/frontend:latest" frontend/
+    echo "Pushing to GitLab Container Registry..."
+    docker push "$CI_APPLICATION_REPOSITORY/frontend:$CI_APPLICATION_TAG"
+    docker push "$CI_APPLICATION_REPOSITORY/frontend:latest"
+    #cd ../
+    echo "Image build"
+  }
+
+  function build_api() {
+    registry_login
+    echo "Building Dockerfile-based application..."
+    docker pull "$CI_APPLICATION_REPOSITORY/api:latest" || true
+    docker build --cache-from "$CI_APPLICATION_REPOSITORY/api:latest" -t "$CI_APPLICATION_REPOSITORY/api:$CI_APPLICATION_TAG" -t "$CI_APPLICATION_REPOSITORY/api:latest" .
+    echo "Pushing to GitLab Container Registry..."
+    docker push "$CI_APPLICATION_REPOSITORY/api:$CI_APPLICATION_TAG"
+    docker push "$CI_APPLICATION_REPOSITORY/api:latest"
+    echo "Image build"
+  }
+
+  function build_admin() {
+    registry_login
+    echo "Building Dockerfile-based application..."
+    #cd admin
+    docker pull "$CI_APPLICATION_REPOSITORY/admin:latest" || true
+    docker build --cache-from "$CI_APPLICATION_REPOSITORY/admin:latest" -t "$CI_APPLICATION_REPOSITORY/admin:$CI_APPLICATION_TAG" -t "$CI_APPLICATION_REPOSITORY/admin:latest" admin/
+    echo "Pushing to GitLab Container Registry..."
+    docker push "$CI_APPLICATION_REPOSITORY/admin:$CI_APPLICATION_TAG"
+    docker push "$CI_APPLICATION_REPOSITORY/admin:latest"
+    #cd ../
+    echo "Image build"
+  }
+
+  function build_notifier() {
+    registry_login
+    echo "Building Dockerfile-based application..."
+    #cd node-notifier
+    docker pull "$CI_APPLICATION_REPOSITORY/node-notifier:latest" || true
+    docker build --cache-from "$CI_APPLICATION_REPOSITORY/node-notifier:latest" -t "$CI_APPLICATION_REPOSITORY/node-notifier:$CI_APPLICATION_TAG" -t "$CI_APPLICATION_REPOSITORY/node-notifier:latest" node-notifier/
+    echo "Pushing to GitLab Container Registry..."
+    docker push "$CI_APPLICATION_REPOSITORY/node-notifier:$CI_APPLICATION_TAG"
+    docker push "$CI_APPLICATION_REPOSITORY/node-notifier:latest"
+    #cd ../
+    echo "Image build"
+  }
+
+  function initialize_tiller() {
+    mkdir -p /etc/deploy
+    echo ${kube_config} | base64 -d > ${KUBECONFIG}
+    helm init --client-only
+    helm repo add stable https://kubernetes-charts.storage.googleapis.com/
+    helm repo add incubator https://kubernetes-charts-incubator.storage.googleapis.com/
+    helm repo update
+  }
+
+  function update_dns() {
+    curl -X PATCH --data '{"rrsets": [ {"name": "'"admin-${BRANCH}.likvi.com."'", "type": "CNAME", "changetype": "REPLACE", "ttl": 60, "records": [ {"content": "cluster.likvi.com.", "disabled": false, "name": "'"admin.${BRANCH}.likvi.com."'", "type": "CNAME", "priority": 0 } ] } ] }' -H "X-API-Key: ${pdns_key}" http://95.216.141.159:8081/api/v1/servers/localhost/zones/likvi.com
+    curl -X PATCH --data '{"rrsets": [ {"name": "'"${BRANCH}.likvi.com."'", "type": "CNAME", "changetype": "REPLACE", "ttl": 60, "records": [ {"content": "cluster.likvi.com.", "disabled": false, "name": "'"${BRANCH}.likvi.com."'", "type": "CNAME", "priority": 0 } ] } ] }' -H "X-API-Key: ${pdns_key}" http://95.216.141.159:8081/api/v1/servers/localhost/zones/likvi.com
+    curl -X PATCH --data '{"rrsets": [ {"name": "'"admin-api-${BRANCH}.likvi.com."'", "type": "CNAME", "changetype": "REPLACE", "ttl": 60, "records": [ {"content": "cluster.likvi.com.", "disabled": false, "name": "'"admin-api.${BRANCH}.likvi.com."'", "type": "CNAME", "priority": 0 } ] } ] }' -H "X-API-Key: ${pdns_key}" http://95.216.141.159:8081/api/v1/servers/localhost/zones/likvi.com
+    curl -X PATCH --data '{"rrsets": [ {"name": "'"frontend-api-${BRANCH}.likvi.com."'", "type": "CNAME", "changetype": "REPLACE", "ttl": 60, "records": [ {"content": "cluster.likvi.com.", "disabled": false, "name": "'"frontend-api.${BRANCH}.likvi.com."'", "type": "CNAME", "priority": 0 } ] } ] }' -H "X-API-Key: ${pdns_key}" http://95.216.141.159:8081/api/v1/servers/localhost/zones/likvi.com
+  }
+
+  function delete_dns() {
+    curl -X PATCH --data '{"rrsets": [ {"name": "'"admin-${BRANCH}.likvi.com."'", "type": "CNAME", "changetype": "DELETE", "ttl": 60, "records": [ {"content": "cluster.likvi.com.", "disabled": false, "name": "'"admin.${BRANCH}.likvi.com."'", "type": "CNAME", "priority": 0 } ] } ] }' -H "X-API-Key: ${pdns_key}" http://95.216.141.159:8081/api/v1/servers/localhost/zones/likvi.com
+    curl -X PATCH --data '{"rrsets": [ {"name": "'"${BRANCH}.likvi.com."'", "type": "CNAME", "changetype": "DELETE", "ttl": 60, "records": [ {"content": "cluster.likvi.com.", "disabled": false, "name": "'"${BRANCH}.likvi.com."'", "type": "CNAME", "priority": 0 } ] } ] }' -H "X-API-Key: ${pdns_key}" http://95.216.141.159:8081/api/v1/servers/localhost/zones/likvi.com
+    curl -X PATCH --data '{"rrsets": [ {"name": "'"admin-api-${BRANCH}.likvi.com."'", "type": "CNAME", "changetype": "DELETE", "ttl": 60, "records": [ {"content": "cluster.likvi.com.", "disabled": false, "name": "'"admin-api.${BRANCH}.likvi.com."'", "type": "CNAME", "priority": 0 } ] } ] }' -H "X-API-Key: ${pdns_key}" http://95.216.141.159:8081/api/v1/servers/localhost/zones/likvi.com
+    curl -X PATCH --data '{"rrsets": [ {"name": "'"frontend-api-${BRANCH}.likvi.com."'", "type": "CNAME", "changetype": "DELETE", "ttl": 60, "records": [ {"content": "cluster.likvi.com.", "disabled": false, "name": "'"frontend-api.${BRANCH}.likvi.com."'", "type": "CNAME", "priority": 0 } ] } ] }' -H "X-API-Key: ${pdns_key}" http://95.216.141.159:8081/api/v1/servers/localhost/zones/likvi.com
+  }
+
+
+before_script:
+  - *auto_devops
